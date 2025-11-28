@@ -1,0 +1,5 @@
+streamlit==1.51.0
+pandas==2.3.3
+numpy==2.3.5
+pulp==2.8.0
+openpyxl==3.1.5

@@ -224,6 +224,9 @@ def compute_leftover_inventory(norm_df, *allocation_dfs):
 st.sidebar.header("Inputs")
 uploaded = st.sidebar.file_uploader("Upload PSI CSV/XLSX", type=["csv","xlsx"])
 
+app_mode = st.sidebar.selectbox("App Mode", ["Multi-Cargo", "Scenario Builder"], index=0)
+
+
 with st.sidebar.expander("Column mapping (optional)"):
     lot_col_opt = st.text_input("Lot ID column name (optional)", value="")
     wmt_col_opt = st.text_input("Available WMT column name (optional)", value="")
@@ -236,6 +239,7 @@ prefer_min_lots = st.sidebar.checkbox("Prefer fewer lots per cargo", value=True)
 k_mode = st.sidebar.selectbox("How many cargoes?", ["Auto (as many as possible)"] + [str(i) for i in range(1, 51)], index=0)
 
 if uploaded is not None:
+    if app_mode == "Multi-Cargo":
     df, delim, header_idx = read_dataframe(uploaded)
     st.success(f"Detected delimiter: '{delim}', header row: {header_idx+1}")
     mapping = map_columns(df, lot_col_opt or None, wmt_col_opt or None)
@@ -283,5 +287,92 @@ if uploaded is not None:
             to_xlsx_sheets(all_sheets, filename=f"multi_cargo_{len(results)}x{int(cargo_wmt)}wmt_floor{target_ni}.xlsx")
     else:
         st.error("Could not find required columns: LotID, WMT_available, Ni. Use the mapping inputs or fix the header row.")
+
+    else:
+        # ---------------- SCENARIO BUILDER ----------------
+        st.subheader("Scenario Builder")
+        x_min_sb = x_min
+        prefer_min_lots_sb = prefer_min_lots
+
+        # How many cargoes in the scenario
+        num_cargo = st.sidebar.number_input("Number of cargoes in scenario", min_value=1, max_value=20, value=3, step=1)
+
+        # Defaults: first cargo target band at 1.30, others Ni floor at 1.43
+        default_targets = [1.30] + [1.43]*(num_cargo-1)
+        default_modes   = ["Target Band"] + ["Ni Floor"]*(num_cargo-1)
+        default_tol     = [0.02] + [0.02]*(num_cargo-1)
+        default_wmt     = [7500]*num_cargo
+
+        scenario = []
+        for i in range(num_cargo):
+            with st.sidebar.expander(f"Cargo {i+1} settings", expanded=(i==0)):
+                wmt = st.number_input(f"Cargo {i+1} WMT", min_value=0, max_value=200000, value=int(default_wmt[i]), step=100, key=f"sb_wmt_{i}")
+                mode = st.selectbox(f"Ni Rule (Cargo {i+1})", ["Ni Floor", "Target Band"], index=0 if default_modes[i]=="Ni Floor" else 1, key=f"sb_mode_{i}")
+                target = st.number_input(f"Ni % (Cargo {i+1})", min_value=0.0, max_value=5.0, value=float(default_targets[i]), step=0.01, key=f"sb_target_{i}")
+                tol = None
+                if mode == "Target Band":
+                    tol = st.number_input(f"Tolerance ±% (Cargo {i+1})", min_value=0.0, max_value=1.0, value=float(default_tol[i]), step=0.005, key=f"sb_tol_{i}")
+                scenario.append({"wmt": wmt, "mode": mode, "target": target, "tol": tol})
+
+        # Read and normalize (same as Multi-Cargo path)
+        df, delim, header_idx = read_dataframe(uploaded)
+        st.success(f"[Scenario] Detected delimiter: '{delim}', header row: {header_idx+1}")
+        mapping = map_columns(df, lot_col_opt or None, wmt_col_opt or None)
+        pos_map = {"A":0, "K":10} if ('use_positions' not in locals() or use_positions) else None
+        base_norm = normalize_df(df, mapping, pos_map)
+        st.subheader("Normalized Preview (Scenario)")
+        st.dataframe(base_norm.head(50))
+
+        if {"LotID","WMT_available","Ni"}.issubset(base_norm.columns):
+            inv = base_norm.copy()
+            cargo_allocs = []
+            sheets = {}
+
+            for i, cfg in enumerate(scenario, start=1):
+                T = cfg["wmt"]
+                if inv["WMT_available"].sum() < T:
+                    st.warning(f"Cargo {i}: Not enough remaining WMT to fill {T}. Stopping here.")
+                    break
+                eps = None if cfg["mode"] == "Ni Floor" else cfg["tol"]
+                rows_df, kpis, solver = optimize_single_cargo(inv, T, cfg["target"], eps, x_min_sb, prefer_min_lots_sb)
+
+                total = rows_df["WMT_to_load"].sum() if not rows_df.empty else 0.0
+                avg = kpis.get("Weighted_Ni_%")
+                feasible = (abs(total - T) < 1e-3) and (avg is not None) and ((eps is None and avg >= cfg["target"] - 1e-12) or (eps is not None and (cfg["target"]-eps-1e-12) <= avg <= (cfg["target"]+eps+1e-12)))
+
+                st.subheader(f"[Scenario] Cargo {i} — {'OK' if feasible else 'FAILED'}")
+                st.dataframe(rows_df)
+                st.write({"Cargo_WMT": total, "Weighted_Ni_%": avg, "Lots_Used": kpis.get("Lots_Used"), "Rule": cfg["mode"], "Target": cfg["target"], "Tol": eps, "Solver": solver})
+
+                if not feasible:
+                    st.error(f"Cargo {i} couldn't meet the rule. Stopping the scenario here.")
+                    break
+
+                cargo_allocs.append(rows_df)
+                sheets[f"Cargo {i}"] = rows_df
+                inv = apply_allocation(inv, rows_df)
+
+                lv, tot = compute_leftover_inventory(base_norm, *cargo_allocs)
+                st.markdown(f"**[Scenario] Leftover AFTER Cargo {i}**")
+                st.dataframe(lv)
+                st.write(tot)
+                sheets[f"Leftover after C{i}"] = lv
+                sheets[f"Totals after C{i}"] = pd.DataFrame([tot])
+
+            if cargo_allocs:
+                final_leftover, final_totals = compute_leftover_inventory(base_norm, *cargo_allocs)
+                st.subheader("[Scenario] Final Leftover")
+                st.dataframe(final_leftover)
+                st.write(final_totals)
+                sheets["Final Leftover"] = final_leftover
+                sheets["Final Totals"] = pd.DataFrame([final_totals])
+
+                # single XLSX
+                to_xlsx_sheets(sheets, filename=f"scenario_{len(cargo_allocs)}_cargoes.xlsx")
+            else:
+                st.info("Scenario built 0 cargo. Adjust Ni rules, WMT, or min-per-lot settings.")
+        else:
+            st.error("Could not find required columns: LotID, WMT_available, Ni. Use the mapping inputs or fix the header row.")
+
 else:
     st.info("Upload a PSI CSV/XLSX to begin.")

@@ -8,7 +8,6 @@ from io import BytesIO
 # ---------------- Basic settings ----------------
 st.set_page_config(page_title="Nickel Blending Optimizer — Multi Cargo", layout="wide")
 st.title("🛠️ Nickel Blending Optimizer — Multi-Cargo (Ni ≥ floor, no avg objective)")
-st.set_option("server.maxUploadSize", 500)  # MB
 
 # --------------- Helpers: IO & normalize ---------------
 def detect_header_and_delim(file_bytes):
